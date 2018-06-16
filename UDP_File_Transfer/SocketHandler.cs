@@ -1,5 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -24,43 +24,40 @@ namespace UDP_File_Transfer
     {
         InActive = 0,
         Connecting,
-        Conntected,
-        TransferData
-    }
-
-    internal struct FileData
-    {
-        public int SequenceNumber;
-        public List<byte> Data;
+        Connected,
+        TransferData,
+        Finalize,
+        Stop
     }
 
     public class SocketHandler
     {
         private ConnectionStatus _status;
+        private Stopwatch _resendTimer;
 
         private ulong _sequenceNumber;
         private ulong _expectedSequenceNumber;
+        private ulong _recvSequenceNumber;
 
         private readonly Thread _receiveThread;
         private readonly Thread _sendThread;
+        private readonly int _resendDelay;
 
         private readonly UdpClient _udpClient;
 
         private bool _receiveThreadRunning;
         private bool _sendThreadRunning;
 
-        private readonly string _myAddress;
         private readonly int _myPort;
 
         private string _destAddress;
         private int _destPort;
 
-        public SocketHandler(string anAdress, int aPort, ulong sequenceNumber)
+        public SocketHandler(int aPort, ulong sequenceNumber, int resendDelay)
         {
-            _sequenceNumber = sequenceNumber;
-
-            _myAddress = anAdress;
             _myPort = aPort;
+            _sequenceNumber = sequenceNumber;
+            _resendDelay = resendDelay;
             
             _receiveThreadRunning = false;
             _sendThreadRunning = false;
@@ -69,15 +66,14 @@ namespace UDP_File_Transfer
             _sendThread = new Thread(SendThreadFunction);
 
             _udpClient = new UdpClient(aPort);
+            _resendTimer = new Stopwatch();
         }
 
         private void ReceiveThreadFunction(object obj)
         {
-            var receiveBuffer = new List<FileData>();
+            FileStream recvFile = null;
 
             var remoteIpEndPoint = new IPEndPoint(IPAddress.Any, _myPort);
-            Console.WriteLine("ReceiveThreadFunction started");
-
             while (_receiveThreadRunning)
             {
                 try
@@ -112,10 +108,10 @@ namespace UDP_File_Transfer
                             break;
 
                         case OpCode.Aec:
-                            if (ConnectionStatus.Connecting == _status)
+                            if (ConnectionStatus.InActive == _status)
                             {
                                 Console.WriteLine("Incoming Accept Establish Connection (AEC) recvSeq: " + recvSequenceNumber);
-                                _status = ConnectionStatus.Conntected;
+                                _status = ConnectionStatus.Connected;
 
                                 _expectedSequenceNumber = recvSequenceNumber;
                                 Console.WriteLine("Connection established!\n");
@@ -124,9 +120,10 @@ namespace UDP_File_Transfer
                             break;
 
                         case OpCode.Sft:
-                            if (ConnectionStatus.Conntected == _status)
+                            if (ConnectionStatus.Connected == _status)
                             {
-                                receiveBuffer.Clear();
+                                recvFile = new FileStream("test1.zip", FileMode.Append);
+
                                 _status = ConnectionStatus.TransferData;
                                 Console.WriteLine("Incoming Start File Transfer (SFT) recvSeq: " + recvSequenceNumber);
 
@@ -138,23 +135,77 @@ namespace UDP_File_Transfer
                             if (ConnectionStatus.TransferData == _status)
                             {
                                 Console.WriteLine("Incoming Transfer data (TRD) recvSeq: " + recvSequenceNumber);
+                                var data = reader.ReadBytes(length);
+
+                                recvFile?.Write(data, 0, data.Length);
 
                                 sendAck = true;
                             }
                             break;
 
+                        case OpCode.Eft:
+                            if (ConnectionStatus.TransferData == _status)
+                            {
+                                Console.WriteLine("Incoming End File Transfer (EFT) recvSeq: " + recvSequenceNumber);
+                                recvFile?.Close();
+                            }
+                            break;
+
+                        case OpCode.Fin:
+                            if (_status >= ConnectionStatus.Connected && _status != ConnectionStatus.Stop)
+                            {
+                                Console.WriteLine("Incoming Finalize (FIN) recvSeq: " + recvSequenceNumber);
+
+                                _status = ConnectionStatus.Finalize;
+
+                                var finPacket = new Packet((ushort)OpCode.Fin);
+                                finPacket.WriteUInt16(0);
+                                finPacket.WriteUInt64(++_sequenceNumber);
+                                var data = finPacket.GetBytes();
+
+                                Console.WriteLine("Sending Finalize (FIN) Seq: " + _sequenceNumber);
+
+                                _udpClient.Send(data, data.Length, remoteIpEndPoint);
+                            }
+                            break;
+
                         case OpCode.Ack:
                             Console.WriteLine("Incoming Acknowledgement (ACK) recvSeq: " + recvSequenceNumber);
-                            if (ConnectionStatus.Connecting == _status)
+
+                            switch (_status)
                             {
-                                _status = ConnectionStatus.Conntected;
-                                Console.WriteLine("Connection established!\n");
+                                case ConnectionStatus.InActive:
+                                    break;
+                                case ConnectionStatus.Connecting:
+                                    _resendTimer.Reset();
+                                    _status = ConnectionStatus.Connected;
+                                    Console.WriteLine("Connection established!\n");
+                                    break;
+                                case ConnectionStatus.Connected:
+                                    _resendTimer.Reset();
+                                    _status = ConnectionStatus.TransferData;
+                                    Console.WriteLine("Ready for File transfer!");
+                                    break;
+                                case ConnectionStatus.TransferData:
+                                    if (_expectedSequenceNumber != recvSequenceNumber)
+                                    {
+                                        Console.WriteLine("Unexpected Sequence Number: " + recvSequenceNumber + "  Expected: " + _expectedSequenceNumber);
+                                    }
+                                    else
+                                    {
+                                        _resendTimer.Reset();
+                                    }
+                                    break;
+                                case ConnectionStatus.Finalize:
+                                case ConnectionStatus.Stop:
+                                    _resendTimer.Reset();
+                                    _receiveThreadRunning = false;
+                                    break;
+                                default:
+                                    throw new ArgumentOutOfRangeException();
                             }
 
-                            if (ConnectionStatus.TransferData == _status && _expectedSequenceNumber != recvSequenceNumber)
-                            {
-                                Console.WriteLine("Unexpected Sequence Number: " + recvSequenceNumber + "  Expected: " + _expectedSequenceNumber);
-                            }
+                            _recvSequenceNumber = recvSequenceNumber;
                             break;
                     }
 
@@ -176,8 +227,6 @@ namespace UDP_File_Transfer
                         
                         Console.WriteLine("Sending Acknowledgement (ACK) Seq: " + recvSequenceNumber);
                     }
-
-                    Thread.Sleep(10);
                 }
                 catch (Exception e)
                 {
@@ -186,11 +235,12 @@ namespace UDP_File_Transfer
             }
 
             _udpClient.Close();
+            Console.WriteLine("UDPClient closed!");
         }
 
         public static byte[] ObjectToByteArray(Object obj)
         {
-            BinaryFormatter bf = new BinaryFormatter();
+            var bf = new BinaryFormatter();
             using (var ms = new MemoryStream())
             {
                 bf.Serialize(ms, obj);
@@ -202,6 +252,7 @@ namespace UDP_File_Transfer
         {
             var fileData = ObjectToByteArray(obj);
             var fileDataIndex = 0;
+            var tempDataIndex = 0;
 
             try
             {
@@ -220,69 +271,103 @@ namespace UDP_File_Transfer
                     switch (_status)
                     {
                         case ConnectionStatus.InActive:
+                            if (!_resendTimer.IsRunning || _resendTimer.ElapsedMilliseconds > _resendDelay)
+                            {
+                                var conPacket = new Packet((ushort)OpCode.Eco);
+                                conPacket.WriteUInt16(0);
+                                conPacket.WriteUInt64(++_sequenceNumber);
+
+                                var data = conPacket.GetBytes();
+                                Console.WriteLine("Sending Establish Connection (ECO) Seq: " + _sequenceNumber);
+
+                                _resendTimer.Restart();
+                                _udpClient.Send(data, data.Length);
+                            }
+
+                            break;
+
+                        case ConnectionStatus.Connected:
                         {
-                            _status = ConnectionStatus.Connecting;
+                            if (!_resendTimer.IsRunning || _resendTimer.ElapsedMilliseconds > _resendDelay)
+                            {
+                                var sftPacket = new Packet((ushort)OpCode.Sft);
+                                sftPacket.WriteUInt16(0);
+                                sftPacket.WriteUInt64(++_sequenceNumber);
+                                var data = sftPacket.GetBytes();
 
-                            var conPacket = new Packet((ushort)OpCode.Eco);
-                            conPacket.WriteUInt16(0);
-                            conPacket.WriteUInt64(++_sequenceNumber);
+                                _expectedSequenceNumber = _sequenceNumber;
+                                Console.WriteLine("Sending Start File Transfer (SFT) Seq: " + _sequenceNumber);
 
-                            var data = conPacket.GetBytes();
-                            Console.WriteLine("Sending Establish Connection (ECO) Seq: " + _sequenceNumber);
-
-                            _udpClient.Send(data, data.Length);
-                        }
-                        break;
-
-                        case ConnectionStatus.Conntected:
-                        {
-                            Thread.Sleep(100);
-                            _status = ConnectionStatus.TransferData;
-
-                            var sftPacket = new Packet((ushort)OpCode.Sft);
-                            sftPacket.WriteUInt16(0);
-                            sftPacket.WriteUInt64(++_sequenceNumber);
-                            var data = sftPacket.GetBytes();
-
-                            _expectedSequenceNumber = _sequenceNumber;
-                            Console.WriteLine("Sending Start File Transfer (SFT) Seq: " + _sequenceNumber);
-
-                            _udpClient.Send(data, data.Length);
+                                _resendTimer.Restart();
+                                _udpClient.Send(data, data.Length);
+                            }
                         }
                         break;
 
                         case ConnectionStatus.TransferData:
                         {
-                            if (_expectedSequenceNumber == _sequenceNumber)
+                            if (!_resendTimer.IsRunning || _expectedSequenceNumber == _recvSequenceNumber)
                             {
-                                if (fileDataIndex < fileData.Length)
-                                {
-                                    var trdPacket = new Packet((ushort)OpCode.Trd);
-                                    var packetSize = fileData.Length - fileDataIndex >= 1464 ? 1464 : fileData.Length - fileDataIndex;
-                                    trdPacket.WriteUInt16(packetSize);
-                                    fileDataIndex += packetSize;
-                                    trdPacket.WriteUInt64(++_sequenceNumber);
-
-                                    var data = trdPacket.GetBytes();
-                                    _expectedSequenceNumber = _sequenceNumber;
-                                    Console.WriteLine("Sending Transfer data (TRD) Seq: " + _sequenceNumber);
-
-                                    _udpClient.Send(data, data.Length);
-                                }
+                                tempDataIndex = fileDataIndex;
                             }
+                            else if (_resendTimer.ElapsedMilliseconds > _resendDelay)
+                            {
+                                fileDataIndex = tempDataIndex;
+                            }
+
+                            if (fileDataIndex < fileData.Length)
+                            {
+                                var trdPacket = new Packet((ushort) OpCode.Trd);
+                                var packetSize = fileData.Length - fileDataIndex >= 1464
+                                    ? 1464
+                                    : fileData.Length - fileDataIndex;
+                                trdPacket.WriteUInt16(packetSize);
+                                trdPacket.WriteUInt64(++_sequenceNumber);
+                                trdPacket.WriteInt8Array(fileData, fileDataIndex, packetSize);
+
+                                var data = trdPacket.GetBytes();
+                                _expectedSequenceNumber = _sequenceNumber;
+                                Console.WriteLine("Sending Transfer data (TRD) Seq: " + _sequenceNumber);
+
+                                _udpClient.Send(data, data.Length);
+
+                                fileDataIndex += packetSize;
+                            }
+                            else
+                            {
+                                _status = ConnectionStatus.Finalize;
+
+                                var eftPacket = new Packet((ushort) OpCode.Eft);
+                                eftPacket.WriteUInt16(0);
+                                eftPacket.WriteUInt64(++_sequenceNumber);
+
+                                var data = eftPacket.GetBytes();
+                                _expectedSequenceNumber = _sequenceNumber;
+                                Console.WriteLine("Sending End File Transfer (EFT) Seq: " + _sequenceNumber);
+
+                                _udpClient.Send(data, data.Length);
+
+                                var finPacket = new Packet((ushort) OpCode.Fin);
+                                finPacket.WriteUInt16(0);
+                                finPacket.WriteUInt64(++_sequenceNumber);
+                                data = finPacket.GetBytes();
+
+                                Console.WriteLine("Sending Finalize (FIN) Seq: " + _sequenceNumber);
+
+                                _udpClient.Send(data, data.Length);
+
+                                _sendThreadRunning = false;
+                            }
+
                         }
                         break;
                     }
-
-                    Thread.Sleep(10);
                 }
                 catch (Exception e)
                 {
                     Console.WriteLine(e.ToString());
                 }
             }
-
-            _udpClient.Close();
         }
 
         public void Send(string address, int port, byte[] data)

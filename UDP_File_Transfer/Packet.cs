@@ -951,11 +951,11 @@ namespace UDP_File_Transfer
                     WriteUInt8(values[x]);
             }
         }
-        public void WriteInt8Array(object[] values)
+        public void WriteInt8Array(byte[] values)
         {
             WriteInt8Array(values, 0, values.Length);
         }
-        public void WriteInt8Array(object[] values, int index, int count)
+        public void WriteInt8Array(byte[] values, int index, int count)
         {
             lock (_mLock)
             {
