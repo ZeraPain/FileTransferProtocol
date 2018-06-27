@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Globalization;
 using System.IO;
 using System.Threading;
 
@@ -15,11 +14,11 @@ namespace UDP_File_Transfer
                 var sh = new SocketHandler(9001, 1000, 1000);
                 sh.Open();
 
-                string fileName = "test.zip";
+                string fileName;
                 do
                 {
                     Console.WriteLine("Please enter file name: ");
-                    //fileName = Console.ReadLine();
+                    fileName = Console.ReadLine();
                 } while (null == fileName || !File.Exists(fileName));
                 
                 sh.Send("127.0.0.1", 9000, File.ReadAllBytes(fileName));
@@ -29,11 +28,6 @@ namespace UDP_File_Transfer
                 Console.WriteLine("[Receiver]");
                 var sh = new SocketHandler(9000, 2000, 1000);
                 sh.Open();
-            }
-
-            while (true)
-            {
-               Thread.Sleep(100);
             }
         }
     }
