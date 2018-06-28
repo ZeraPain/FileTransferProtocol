@@ -12,7 +12,7 @@ namespace UDP_File_Transfer
             if (args.Length == 0)
             {
                 Console.WriteLine("[Sender]");
-                var sh = new SocketHandler(9001, 1000, 1000);
+                var sh = new SocketHandler(9001, 1000, 500);
                 sh.Open();
 
                 string fileName = "test.zip";
@@ -27,7 +27,7 @@ namespace UDP_File_Transfer
             else
             {
                 Console.WriteLine("[Receiver]");
-                var sh = new SocketHandler(9000, 2000, 1000);
+                var sh = new SocketHandler(9000, 2000, 500);
                 sh.Open();
             }
 
